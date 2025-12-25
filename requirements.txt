@@ -1,7 +1,0 @@
-curl_cffi
-fastapi
-uvicorn
-coincurve
-beautifulsoup4
-pydantic
-colorama

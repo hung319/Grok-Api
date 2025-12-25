@@ -1,10 +1,11 @@
-from core        import Log, Run, Utils, Parser, Signature, Anon, Headers
+from core         import Log, Run, Utils, Parser, Signature, Anon, Headers
 from curl_cffi   import requests, CurlMime
 from dataclasses import dataclass, field
 from bs4         import BeautifulSoup
 from json        import dumps, loads
 from secrets     import token_hex
 from uuid        import uuid4
+from typing      import Generator
 
 @dataclass
 class Models:
@@ -21,7 +22,6 @@ class Models:
 _Models = Models()
 
 class Grok:
-    
     
     def __init__(self, model: str = "grok-3-auto", proxy: str = None) -> None:
         self.session: requests.session.Session = requests.Session(impersonate="chrome136", default_headers=False)
@@ -110,8 +110,179 @@ class Grok:
                     self.svg_data, self.numbers = Parser.parse_values(c_request.text, self.anim, self.xsid_script)
                     
             self.c_run += 1
+
+    # =========================================================================
+    # NEW STREAMING METHOD WITH XML FILTER
+    # =========================================================================
+    def chat_stream(self, message: str, extra_data: dict = None) -> Generator[str, None, None]:
         
-    
+        # 1. Initialization (Load or Restore)
+        if not extra_data:
+            self._load()
+            self.c_request(self.actions[0])
+            self.c_request(self.actions[1])
+            self.c_request(self.actions[2])
+            xsid = Signature.generate_sign('/rest/app-chat/conversations/new', 'POST', self.verification_token, self.svg_data, self.numbers)
+            url = 'https://grok.com/rest/app-chat/conversations/new'
+        else:
+            self._load(extra_data)
+            self.c_run = 1
+            self.anon_user = extra_data["anon_user"]
+            self.keys["privateKey"] = extra_data["privateKey"]
+            self.c_request(self.actions[1])
+            self.c_request(self.actions[2])
+            xsid = Signature.generate_sign(f'/rest/app-chat/conversations/{extra_data["conversationId"]}/responses', 'POST', self.verification_token, self.svg_data, self.numbers)
+            url = f'https://grok.com/rest/app-chat/conversations/{extra_data["conversationId"]}/responses'
+
+        # 2. Prepare Headers
+        self.session.headers = self.headers.CONVERSATION
+        self.session.headers.update({
+            'baggage': self.baggage,
+            'sentry-trace': f'{self.sentry_trace}-{str(uuid4()).replace("-", "")[:16]}-0',
+            'x-statsig-id': xsid,
+            'x-xai-request-id': str(uuid4()),
+            'traceparent': f"00-{token_hex(16)}-{token_hex(8)}-00"
+        })
+        self.session.headers = Headers.fix_order(self.session.headers, self.headers.CONVERSATION)
+
+        # 3. Construct Payload
+        if not extra_data:
+            conversation_data = {
+                'temporary': False,
+                'modelName': self.model,
+                'message': message,
+                'fileAttachments': [],
+                'imageAttachments': [],
+                'disableSearch': False,
+                'enableImageGeneration': True,
+                'returnImageBytes': False,
+                'returnRawGrokInXaiRequest': False,
+                'enableImageStreaming': True,
+                'imageGenerationCount': 2,
+                'forceConcise': False,
+                'toolOverrides': {},
+                'enableSideBySide': True,
+                'sendFinalMetadata': True,
+                'isReasoning': False,
+                'webpageUrls': [],
+                'disableTextFollowUps': False,
+                'responseMetadata': {
+                    'requestModelDetails': {
+                        'modelId': self.model,
+                    },
+                },
+                'disableMemory': False,
+                'forceSideBySide': False,
+                'modelMode': self.model_mode,
+                'isAsyncChat': False,
+            }
+        else:
+            conversation_data = {
+                'message': message,
+                'modelName': self.model,
+                'parentResponseId': extra_data["parentResponseId"],
+                'disableSearch': False,
+                'enableImageGeneration': True,
+                'imageAttachments': [],
+                'returnImageBytes': False,
+                'returnRawGrokInXaiRequest': False,
+                'fileAttachments': [],
+                'enableImageStreaming': True,
+                'imageGenerationCount': 2,
+                'forceConcise': False,
+                'toolOverrides': {},
+                'enableSideBySide': True,
+                'sendFinalMetadata': True,
+                'customPersonality': '',
+                'isReasoning': False,
+                'webpageUrls': [],
+                'metadata': {
+                    'requestModelDetails': {
+                        'modelId': self.model,
+                    },
+                    'request_metadata': {
+                        'model': self.model,
+                        'mode': self.mode,
+                    },
+                },
+                'disableTextFollowUps': False,
+                'disableArtifact': False,
+                'isFromGrokFiles': False,
+                'disableMemory': False,
+                'forceSideBySide': False,
+                'modelMode': self.model_mode,
+                'isAsyncChat': False,
+                'skipCancelCurrentInflightRequests': False,
+                'isRegenRequest': False,
+            }
+
+        # 4. Execute Streaming Request with Filtering
+        try:
+            response = self.session.post(url, json=conversation_data, timeout=9999, stream=True)
+            
+            if response.status_code != 200:
+                # Return plain text error for server to handle
+                yield f"Error: {response.text}"
+                return
+
+            buffer = ""
+            is_hiding = False # Flag to hide <xai:tool_usage_card> content
+
+            for line in response.iter_lines():
+                if not line: continue
+                line_text = line.decode('utf-8')
+                
+                try:
+                    data = loads(line_text)
+                    result = data.get('result', {})
+                    
+                    # Extract token from various possible locations
+                    token = result.get('response', {}).get('token') or \
+                            result.get('modelResponse', {}).get('token') or \
+                            result.get('token')
+                    
+                    if token:
+                        buffer += token
+
+                        # -- Filter Logic Start --
+                        if not is_hiding:
+                            # Detect start of junk tag
+                            if "<xai:" in buffer:
+                                is_hiding = True
+                            else:
+                                # Optimization: Yield if buffer gets long and no tag found
+                                if len(buffer) > 50: 
+                                    yield buffer[:-10]
+                                    buffer = buffer[-10:]
+                        
+                        if is_hiding:
+                            # Detect end of junk tag
+                            # Note: We look for the closing tag of the card
+                            if "</xai:tool_usage_card>" in buffer:
+                                parts = buffer.split("</xai:tool_usage_card>")
+                                buffer = parts[-1] # Keep only what's after the tag
+                                is_hiding = False
+                                
+                                # Yield remaining clean text immediately
+                                if buffer and "<xai:" not in buffer:
+                                    yield buffer
+                                    buffer = ""
+                        # -- Filter Logic End --
+
+                except Exception:
+                    continue
+            
+            # Flush remaining buffer at end of stream
+            if buffer and not is_hiding:
+                yield buffer
+
+        except Exception as e:
+            Log.Error(f"Stream Error: {e}")
+            yield f"Error: {str(e)}"
+
+    # =========================================================================
+    # ORIGINAL SYNC METHOD (Backward Compatibility)
+    # =========================================================================
     def start_convo(self, message: str, extra_data: dict = None) -> dict:
         
         if not extra_data:
@@ -139,6 +310,7 @@ class Grok:
         })
         self.session.headers = Headers.fix_order(self.session.headers, self.headers.CONVERSATION)
         
+        # Payload construction logic matches chat_stream but returns dict
         if not extra_data:
             conversation_data: dict = {
                 'temporary': False,
@@ -302,5 +474,3 @@ class Grok:
                 Log.Error("Something went wrong")
                 Log.Error(convo_request.text)
                 return {"error": convo_request.text}
-            
-
